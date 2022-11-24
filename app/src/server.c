@@ -513,27 +513,36 @@ sc_server_on_terminated(void *userdata) {
     LOGD("Server terminated");
 }
 
-static bool
-is_tcpip_mode_enabled(struct sc_server *server, const char *serial) {
+static uint16_t
+get_adb_tcp_port(struct sc_server *server, const char *serial) {
     struct sc_intr *intr = &server->intr;
 
     char *current_port =
         sc_adb_getprop(intr, serial, "service.adb.tcp.port", SC_ADB_SILENT);
     if (!current_port) {
-        return false;
+        return 0;
     }
 
-    // Is the device is listening on TCP on port 5555?
-    bool enabled = !strcmp("5555", current_port);
+    long value;
+    bool ok = sc_str_parse_integer(current_port, &value);
     free(current_port);
-    return enabled;
+    if (!ok) {
+        return 0;
+    }
+
+    if (value < 0 || value > 0xffff) {
+        return 0;
+    }
+
+    return value;
 }
 
 static bool
 wait_tcpip_mode_enabled(struct sc_server *server, const char *serial,
-                        unsigned attempts, sc_tick delay) {
-    if (is_tcpip_mode_enabled(server, serial)) {
-        LOGI("TCP/IP mode enabled");
+                        uint16_t expected_port, unsigned attempts,
+                        sc_tick delay) {
+    uint16_t adb_port = get_adb_tcp_port(server, serial);
+    if (adb_port == expected_port) {
         return true;
     }
 
@@ -547,27 +556,22 @@ wait_tcpip_mode_enabled(struct sc_server *server, const char *serial,
             return false;
         }
 
-        if (is_tcpip_mode_enabled(server, serial)) {
-            LOGI("TCP/IP mode enabled");
+        adb_port = get_adb_tcp_port(server, serial);
+        if (adb_port == expected_port) {
             return true;
         }
     } while (--attempts);
     return false;
 }
 
-char *
-append_port_5555(const char *ip) {
-    size_t len = strlen(ip);
-
-    // sizeof counts the final '\0'
-    char *ip_port = malloc(len + sizeof(":5555"));
-    if (!ip_port) {
+static char *
+append_port(const char *ip, uint16_t port) {
+    char *ip_port;
+    int ret = asprintf(&ip_port, "%s:%" PRIu16, ip, port);
+    if (ret == -1) {
         LOG_OOM();
         return NULL;
     }
-
-    memcpy(ip_port, ip, len);
-    memcpy(ip_port + len, ":5555", sizeof(":5555"));
 
     return ip_port;
 }
@@ -586,15 +590,8 @@ sc_server_switch_to_tcpip(struct sc_server *server, const char *serial) {
         return NULL;
     }
 
-    char *ip_port = append_port_5555(ip);
-    free(ip);
-    if (!ip_port) {
-        return NULL;
-    }
-
-    bool tcp_mode = is_tcpip_mode_enabled(server, serial);
-
-    if (!tcp_mode) {
+    uint16_t adb_port = get_adb_tcp_port(server, serial);
+    if (!adb_port) {
         bool ok = sc_adb_tcpip(intr, serial, 5555, SC_ADB_NO_STDOUT);
         if (!ok) {
             LOGE("Could not restart adbd in TCP/IP mode");
@@ -603,16 +600,26 @@ sc_server_switch_to_tcpip(struct sc_server *server, const char *serial) {
 
         unsigned attempts = 40;
         sc_tick delay = SC_TICK_FROM_MS(250);
-        ok = wait_tcpip_mode_enabled(server, serial, attempts, delay);
+        ok = wait_tcpip_mode_enabled(server, serial, 5555, attempts, delay);
         if (!ok) {
             goto error;
         }
+
+        adb_port = 5555;
+    }
+
+    LOGI("TCP/IP mode enabled on port %" PRIu16, adb_port);
+
+    char *ip_port = append_port(ip, adb_port);
+    free(ip);
+    if (!ip_port) {
+        return NULL;
     }
 
     return ip_port;
 
 error:
-    free(ip_port);
+    free(ip);
     return NULL;
 }
 
@@ -640,7 +647,7 @@ sc_server_configure_tcpip_known_address(struct sc_server *server,
                                         const char *addr) {
     // Append ":5555" if no port is present
     bool contains_port = strchr(addr, ':');
-    char *ip_port = contains_port ? strdup(addr) : append_port_5555(addr);
+    char *ip_port = contains_port ? strdup(addr) : append_port(addr, 5555);
     if (!ip_port) {
         LOG_OOM();
         return false;
